@@ -1,0 +1,99 @@
+name: Auto-Sync & Multi-Board Custom Release
+
+on:
+  schedule:
+    # Draait elke nacht om 02:00 UTC om te controleren op upstream updates
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Knop in GitHub om de build direct handmatig te starten
+
+jobs:
+  # JOBS 1: Haal de code op, sync upstream en voer de Sync Word patch in-memory uit
+  prepare-code:
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Sync upstream (Meshtastic Firmware)
+        run: |
+          git remote add upstream https://github.com/meshtastic/firmware.git || true
+          git fetch upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge upstream/master --no-edit || git merge upstream/main --no-edit || true
+
+      - name: Apply Custom Sync Word In-Memory
+        run: |
+          SYNC_WORD="${{ secrets.CUSTOM_SYNC_WORD }}"
+          SYNC_WORD=${SYNC_WORD:-0x42}
+          echo "Sync Word wordt in-memory aangepast naar: $SYNC_WORD"
+          sed -i "s/const uint8_t syncWord = 0x2b;/const uint8_t syncWord = $SYNC_WORD;/g" src/mesh/RadioLibInterface.h
+
+      - name: Determine Version Name
+        id: get_version
+        run: |
+          TIMESTAMP=$(date +'%Y.%m.%d-%H%M')
+          echo "version=v$TIMESTAMP-custom" >> $GITHUB_OUTPUT
+
+  # JOBS 2: Bouw de 3 verschillende firmware versies met de Matrix strategy
+  build-multi-boards:
+    needs: prepare-code
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "esp32s3"
+            pio_env: "heltec-v3"
+          - platform: "esp32s3"
+            pio_env: "heltec-v4"
+          - platform: "nrf52"
+            pio_env: "t114" # Of vervang door 't114' voor Heltec nRF52
+    uses: ./.github/workflows/build-firmware.yml
+    with:
+      version: ${{ needs.prepare-code.outputs.build_version }}
+      platform: ${{ matrix.platform }}
+      pio_env: ${{ matrix.pio_env }}
+
+  # JOBS 3: Verzamel alle gegenereerde binaries en publiceer ze in GitHub Releases
+  publish-release:
+    needs: [prepare-code, build-multi-boards]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Alle Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+          path: release-files
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-code.outputs.build_version }}
+          name: Custom Meshtastic Release ${{ needs.prepare-code.outputs.build_version }}
+          body: |
+            ### 🔒 Custom Closed-Mesh Firmware Release
+            Automatisch gebouwde firmware.
+            
+            **Inhoud van deze Release:**
+            - **Heltec V3** (`firmware-heltec-v3-*.bin`)
+            - **Heltec V4** (`firmware-heltec-v4-*.bin`)
+            - **nRF52 / RAK4631** (`firmware-rak4631-*.zip` / `.hex`)
+          draft: false
+          prerelease: false
+          files: |
+            release-files/*.bin
+            release-files/*.factory.bin
+            release-files/*.zip
+            release-files/*.hex
+            release-files/*.uf2
+            release-files/*.mt.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
